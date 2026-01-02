@@ -29,6 +29,7 @@ import sqlite3
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 from typing import Iterator, List, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -39,13 +40,15 @@ import embedder_st as embcfg  # embedding model knobs live here
 from spellcheck import init_spellchecker, fix_spelling
 from sentencizer import build_nlp, spacy_sentences
 from preprocess import preprocess
-from data import american_stories_local
+from data import american_stories
 
 # ============================================================
 # CONFIGURATION (edit here)
 # ============================================================
 
 YEARS_FILE = "years.txt"   # one year per line, comments allowed with '#'
+
+DATASET = american_stories
 
 # Multiprocessing (chunking)
 N_PROCESSES = cpu_count()
@@ -60,11 +63,19 @@ WINDOW_SENTENCES = 2
 STRIDE_SENTENCES = 1
 MIN_CHUNK_WORDS = 16
 
-# Progress tracking DB
-SQLITE_PATH = "embedded_progress.sqlite"
-
 # Parquet output
 PARQUET_COMPRESSION = "zstd"  # good speed/size tradeoff
+
+# Resolve project root (src/..)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+
+# NEW: Put ALL sqlite + parquet outputs in project_root/out
+OUT_DIR = PROJECT_ROOT / "out"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Progress tracking DB (in out/)
+SQLITE_PATH = str(OUT_DIR / "embedded_progress.sqlite")
 
 # ============================================================
 # Globals initialized per worker
@@ -253,7 +264,7 @@ def recover_staging_if_present(year: int, parquet_path: str, staging_path: str, 
         print(f"[{year}] Recovery merge succeeded.")
     except Exception as e:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        corrupt_path = f"{year}.staging.corrupt.{ts}.parquet"
+        corrupt_path = str(OUT_DIR / f"{year}.staging.corrupt.{ts}.parquet")
         try:
             os.replace(staging_path, corrupt_path)
         except Exception:
@@ -273,14 +284,14 @@ def init_worker(window_sentences: int, stride_sentences: int):
 
     init_spellchecker(
         word_dicts=[
-            "../data/frequency_dictionary_en_82_765.txt",
-            "../data/gnis-words.txt",
-            "../data/jrc-names-words.txt",
+            DATA_DIR / "frequency_dictionary_en_82_765.txt",
+            DATA_DIR / "gnis-words.txt",
+            DATA_DIR / "jrc-names-words.txt",
         ],
         bigram_dicts=[
-            "../data/frequency_bigramdictionary_en_243_342.txt",
-            "../data/gnis-bigrams.txt",
-            "../data/jrc-names-bigrams.txt",
+            DATA_DIR / "frequency_bigramdictionary_en_243_342.txt",
+            DATA_DIR / "gnis-bigrams.txt",
+            DATA_DIR / "jrc-names-bigrams.txt",
         ],
         max_edit_distance=2,
         prefix_length=7,
@@ -363,8 +374,9 @@ def run_year(
     parquet_schema: pa.Schema,
     pool: Pool,
 ) -> None:
-    parquet_path = f"{year}.parquet"
-    staging_path = f"{year}.staging.parquet"
+    # NEW: out/<YEAR>.parquet etc.
+    parquet_path = str(OUT_DIR / f"{year}.parquet")
+    staging_path = str(OUT_DIR / f"{year}.staging.parquet")
 
     # Crash recovery per-year (before checking year_done)
     recover_staging_if_present(year, parquet_path, staging_path, parquet_schema)
@@ -381,7 +393,7 @@ def run_year(
         )
 
     # Load dataset
-    articles = american_stories_local(year)
+    articles = DATASET(year)
     ex_iter = iter_examples_local(articles, limit=DOC_LIMIT)
 
     staging_writer = pq.ParquetWriter(staging_path, schema=parquet_schema, compression=PARQUET_COMPRESSION)
@@ -548,6 +560,7 @@ def main():
     print(f"Model: {embcfg.MODEL_NAME} (dim={embedding_dim})")
     print(f"Device: {device}")
     print(f"Processes: {N_PROCESSES} | pool chunksize: {POOL_CHUNKSIZE}")
+    print(f"Out dir: {OUT_DIR}")
     print()
 
     # Create ONE pool and reuse across all years (saves spaCy/SymSpell init costs)
