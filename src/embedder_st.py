@@ -35,6 +35,7 @@ ENABLE_CUDA_EXTRA_KWARGS: bool = True
 # Note: These require a Transformers backend/model that supports them.
 CUDA_MODEL_KWARGS: dict[str, Any] = {
     "attn_implementation": "flash_attention_2",
+    "torch_dtype": torch.float16,
     "device_map": "auto",
 }
 

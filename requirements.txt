@@ -1,6 +1,8 @@
-datasets==4.4.2
+datasets==2.2.1
 torch
 transformers==4.57.3
-spacy==3.8.11
+spacy==3.7.5
 symspellpy==6.9.0
 sentence-transformers==5.2.0
+unidecode==1.4.0
+accelerate==1.12.0
