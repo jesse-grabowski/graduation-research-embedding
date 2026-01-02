@@ -2,3 +2,4 @@ datasets==4.4.2
 torch
 transformers==4.57.3
 spacy==3.8.11
+symspellpy==6.9.0

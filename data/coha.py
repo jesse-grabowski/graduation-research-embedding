@@ -53,7 +53,7 @@ for path in glob.glob(os.path.join(DIR, "*.txt")):
 # write words (only >= 4 chars)
 with open(f"{PREFIX}-words.txt", "w", encoding="utf-8") as out:
     for word, count in word_freq.items():
-        if len(word) >= 4:
+        if len(word) >= 4 and count > 10:
             out.write(f"{word} {count}\n")
 
 # write bigrams

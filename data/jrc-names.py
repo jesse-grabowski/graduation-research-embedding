@@ -36,7 +36,7 @@ with open(INFILE, "r", encoding="utf-8", errors="ignore") as f:
         bigram_freq.update((tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1))
 
 # DROP single-character words
-word_freq = Counter({w: c for w, c in word_freq.items() if len(w) > 1})
+word_freq = Counter({w: c for w, c in word_freq.items() if len(w) > 1 and c >= 3})
 
 with open("jrc-names-words.txt", "w", encoding="utf-8") as out:
     for word, count in word_freq.items():

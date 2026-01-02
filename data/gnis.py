@@ -30,8 +30,8 @@ for path in glob.glob(os.path.join(DIR, "*.txt")):
                 for i in range(len(tokens) - 1)
             )
 
-# DROP single-character words
-word_freq = Counter({w: c for w, c in word_freq.items() if len(w) > 1})
+# DROP single-character or infrequent words
+word_freq = Counter({w: c for w, c in word_freq.items() if len(w) > 1 and c >= 3})
 
 # write words
 with open("gnis-words.txt", "w", encoding="utf-8") as out:

@@ -3,6 +3,7 @@ from unidecode import unidecode
 from spacy.symbols import ORTH
 import spacy
 from spacy.language import Language
+from spellcheck import fix_spelling
 import re
 
 from huggingface_hub import hf_hub_download
@@ -29,15 +30,26 @@ def american_stories(year: int):
     return ds["train"]
 
 def collapse_whitespace(text: str) -> str:
-    splitlines = text.splitlines
-    strip = str.strip
-    rstrip = str.rstrip
+    parts = []
+    prev_hyphen = False
 
-    joined = ' '.join(
-        rstrip(strip(line), '-')
-        for line in splitlines()
-    )
-    return ' '.join(joined.split())
+    for line in text.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if prev_hyphen:
+            parts.append(line)
+        else:
+            parts.append(" " + line if parts else line)
+
+        prev_hyphen = line.endswith("-")
+        if prev_hyphen:
+            parts[-1] = parts[-1][:-1]
+
+    return " ".join("".join(parts).split())
+
 
 
 
@@ -65,18 +77,20 @@ nlp.add_pipe("fix_name_abbrev_sents", before="parser")
 
 def spacy_sentences(text: str) -> list[str]:
     doc = nlp(text)
-    return [s.text for s in doc.sents]
+    return [s.text + "." for s in doc.sents]
+
 
 if __name__ == "__main__":
     print(nlp.pipe_names)
 
-    articles = american_stories_local(1770)
+    articles = american_stories_local(1871)
     print(articles[0])
     # text = next(iter(articles))["article"]
-    text = articles[1]["article"]
+    text = articles[7]["article"]
     text = unidecode(text)
     text = collapse_whitespace(text)
     print(text)
     sentences = spacy_sentences(text)
     for sentence in sentences:
-        print(sentence)
+        fixed, stats = fix_spelling(sentence)
+        print(f"{stats.percent_changed:.2f}, {stats.final_in_dict_fraction:.2f}: ", fixed)
