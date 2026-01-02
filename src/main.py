@@ -1,4 +1,506 @@
-from datasets import load_dataset
+# bench_mp.py
+# preprocess -> spellcheck -> sentencize -> chunk (mp) -> embed (main process) -> write Parquet
+# Reports ONLY tokens/sec (wall-clock).
+#
+# SQLite tracking:
+# - embedded_articles(year, article_id) marks an article done
+# - embedded_years(year) marks a full year done
+#
+# We mark an article "done" only when the *last kept chunk* for that article
+# has been embedded (detected via is_last flag in the embedding buffer).
+#
+# Parquet output:
+# - Writes embeddings to "<YEAR>.parquet" with upsert semantics on (article_id, chunk_id)
+# - Columns: article_id, chunk_id, chunk_text, embedding
+# - Uses a staging parquet "<YEAR>.staging.parquet" during the run and merges/dedupes at the end.
+#
+# Crash recovery:
+# - If "<YEAR>.staging.parquet" exists at startup, we try to merge it into "<YEAR>.parquet"
+#   BEFORE checking year_done / starting new work.
+# - If staging is corrupt/unreadable, we rename it to "<YEAR>.staging.corrupt.<ts>.parquet".
 
-# Login using e.g. `huggingface-cli login` to access this dataset
-ds = load_dataset("davidaulloa/AmericanStories")
+from __future__ import annotations
+
+import os
+import uuid
+import time
+import sqlite3
+from datetime import datetime
+from multiprocessing import Pool, cpu_count
+from typing import Iterator, List, Optional, Tuple
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import embedder_st as embcfg  # <- all embedding model knobs live here
+
+from spellcheck import init_spellchecker, fix_spelling
+from sentencizer import build_nlp, spacy_sentences
+from preprocess import preprocess
+from data import american_stories_local
+
+# ============================================================
+# CONFIGURATION (edit here)
+# ============================================================
+
+YEAR = 1800
+
+# Multiprocessing (chunking)
+N_PROCESSES = cpu_count()
+POOL_CHUNKSIZE = 4
+
+# Dataset
+DOC_LIMIT = None        # None = no limit (note: year completion requires full run)
+PROGRESS_EVERY = 500    # docs; set to 0 to disable
+
+# Chunking
+WINDOW_SENTENCES = 2
+STRIDE_SENTENCES = 1
+MIN_CHUNK_WORDS = 16
+
+# Progress tracking DB
+SQLITE_PATH = "embedded_progress.sqlite"
+
+# Parquet output
+PARQUET_PATH = f"{YEAR}.parquet"
+PARQUET_STAGING_PATH = f"{YEAR}.staging.parquet"
+PARQUET_COMPRESSION = "zstd"  # good speed/size tradeoff
+
+# ============================================================
+# Globals initialized per worker
+# ============================================================
+_NLP = None
+_WINDOW_SENTENCES = WINDOW_SENTENCES
+_STRIDE_SENTENCES = STRIDE_SENTENCES
+
+
+# ============================================================
+# SQLite helpers (MAIN PROCESS ONLY)
+# ============================================================
+
+def init_db(conn: sqlite3.Connection):
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embedded_articles (
+          year       INTEGER NOT NULL,
+          article_id TEXT    NOT NULL,
+          PRIMARY KEY (year, article_id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embedded_years (
+          year INTEGER NOT NULL PRIMARY KEY
+        )
+        """
+    )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_embedded_articles_year ON embedded_articles(year)")
+    conn.commit()
+
+
+def year_done(conn: sqlite3.Connection, year: int) -> bool:
+    cur = conn.execute("SELECT 1 FROM embedded_years WHERE year=?", (year,))
+    return cur.fetchone() is not None
+
+
+def mark_year_done(conn: sqlite3.Connection, year: int):
+    conn.execute("INSERT OR IGNORE INTO embedded_years(year) VALUES (?)", (year,))
+    conn.commit()
+
+
+def article_done(conn: sqlite3.Connection, year: int, article_id: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM embedded_articles WHERE year=? AND article_id=?",
+        (year, article_id),
+    )
+    return cur.fetchone() is not None
+
+
+def mark_articles_done(conn: sqlite3.Connection, year: int, article_ids: List[str]):
+    if not article_ids:
+        return
+    uniq = list({aid for aid in article_ids if aid is not None})
+    if not uniq:
+        return
+    conn.executemany(
+        "INSERT OR IGNORE INTO embedded_articles(year, article_id) VALUES (?, ?)",
+        [(year, aid) for aid in uniq],
+    )
+    conn.commit()
+
+
+# ============================================================
+# Parquet helpers (MAIN PROCESS ONLY)
+# ============================================================
+
+def make_parquet_schema(embedding_dim: int) -> pa.Schema:
+    # Fixed-size list type via list_(..., list_size=dim) (compatible across pyarrow versions)
+    return pa.schema([
+        ("article_id", pa.string()),
+        ("chunk_id", pa.int32()),
+        ("chunk_text", pa.string()),
+        ("embedding", pa.list_(pa.float32(), list_size=embedding_dim)),
+    ])
+
+
+def write_batch_to_staging(
+    writer: pq.ParquetWriter,
+    article_ids: List[str],
+    chunk_ids: List[int],
+    chunk_texts: List[str],
+    emb: np.ndarray,
+    embedding_dim: int,
+) -> None:
+    if emb.dtype != np.float32:
+        emb = emb.astype(np.float32, copy=False)
+    if not emb.flags["C_CONTIGUOUS"]:
+        emb = np.ascontiguousarray(emb, dtype=np.float32)
+
+    arr_article = pa.array(article_ids, type=pa.string())
+    arr_chunk = pa.array(chunk_ids, type=pa.int32())
+    arr_text = pa.array(chunk_texts, type=pa.string())
+
+    flat = pa.array(emb.reshape(-1), type=pa.float32())
+    arr_emb = pa.FixedSizeListArray.from_arrays(flat, embedding_dim)
+
+    table = pa.Table.from_arrays(
+        [arr_article, arr_chunk, arr_text, arr_emb],
+        names=["article_id", "chunk_id", "chunk_text", "embedding"],
+    )
+    writer.write_table(table)
+
+
+def merge_upsert_parquet(final_path: str, staging_path: str, schema: pa.Schema) -> None:
+    """
+    Upsert semantics for Parquet by rewriting:
+      final = dedupe(concat(existing, staging), key=(article_id, chunk_id), keep="last")
+    """
+    if not os.path.exists(staging_path):
+        return
+
+    staging = pq.read_table(staging_path)
+
+    if os.path.exists(final_path):
+        existing = pq.read_table(final_path)
+        combined = pa.concat_tables([existing, staging], promote_options="permissive")
+    else:
+        combined = staging
+
+    rownum = pa.array(np.arange(combined.num_rows, dtype=np.int64))
+    combined = combined.append_column("_rownum", rownum)
+
+    if hasattr(combined, "group_by"):
+        gb = combined.group_by(["article_id", "chunk_id"]).aggregate([("_rownum", "max")])
+        max_col = "_rownum_max" if "_rownum_max" in gb.column_names else gb.column_names[-1]
+        indices = gb[max_col].cast(pa.int64())
+
+        winners = combined.take(indices)
+        winners = winners.drop(["_rownum"])
+        winners = winners.select(schema.names)
+    else:
+        df = combined.to_pandas()
+        df = df.sort_values("_rownum").drop_duplicates(["article_id", "chunk_id"], keep="last")
+        df = df.drop(columns=["_rownum"])
+        winners = pa.Table.from_pandas(df, preserve_index=False).select(schema.names)
+
+    tmp = f"{final_path}.tmp.{uuid.uuid4().hex}"
+    pq.write_table(winners, tmp, compression=PARQUET_COMPRESSION)
+    os.replace(tmp, final_path)
+
+    os.remove(staging_path)
+
+
+def recover_staging_if_present(schema: pa.Schema) -> None:
+    if not os.path.exists(PARQUET_STAGING_PATH):
+        return
+
+    print(f"Found existing staging file: {PARQUET_STAGING_PATH} -> attempting recovery merge...")
+    try:
+        merge_upsert_parquet(PARQUET_PATH, PARQUET_STAGING_PATH, schema)
+        print("Recovery merge succeeded.")
+    except Exception as e:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        corrupt_path = f"{YEAR}.staging.corrupt.{ts}.parquet"
+        try:
+            os.replace(PARQUET_STAGING_PATH, corrupt_path)
+        except Exception:
+            corrupt_path = PARQUET_STAGING_PATH
+        print(f"Recovery merge failed; staging renamed to: {corrupt_path}")
+        print(f"Error: {e}")
+
+
+# ============================================================
+# Worker setup
+# ============================================================
+
+def init_worker(window_sentences: int, stride_sentences: int):
+    global _NLP, _WINDOW_SENTENCES, _STRIDE_SENTENCES
+    _WINDOW_SENTENCES = window_sentences
+    _STRIDE_SENTENCES = stride_sentences
+
+    init_spellchecker(
+        word_dicts=[
+            "../data/frequency_dictionary_en_82_765.txt",
+            "../data/gnis-words.txt",
+            "../data/jrc-names-words.txt",
+        ],
+        bigram_dicts=[
+            "../data/frequency_bigramdictionary_en_243_342.txt",
+            "../data/gnis-bigrams.txt",
+            "../data/jrc-names-bigrams.txt",
+        ],
+        max_edit_distance=2,
+        prefix_length=7,
+    )
+
+    _NLP = build_nlp()
+
+
+# ============================================================
+# Chunking + processing
+# ============================================================
+
+def count_words_fast(s: str) -> int:
+    if not s:
+        return 0
+    return s.count(" ") + 1
+
+
+def make_sentence_windows(sentences: List[str], window: int, stride: int) -> Iterator[str]:
+    n = len(sentences)
+    if n == 0:
+        return
+
+    if n < window:
+        yield " ".join(sentences)
+        return
+
+    for start in range(0, n - window + 1, stride):
+        yield " ".join(sentences[start : start + window])
+
+    last_start = n - window
+    if last_start % stride != 0:
+        yield " ".join(sentences[last_start : last_start + window])
+
+
+def process_article(ex: dict):
+    global _NLP, _WINDOW_SENTENCES, _STRIDE_SENTENCES
+
+    t0 = time.perf_counter()
+    try:
+        article_id = ex["article_id"]
+        article_text = ex["article"]
+
+        text = preprocess(article_text)
+        fixed, _stats = fix_spelling(text)
+
+        sentences = spacy_sentences(fixed, nlp=_NLP)
+        if not isinstance(sentences, list):
+            sentences = list(sentences)
+
+        chunk_texts = list(make_sentence_windows(sentences, _WINDOW_SENTENCES, _STRIDE_SENTENCES))
+
+        elapsed = time.perf_counter() - t0
+        return article_id, chunk_texts, elapsed, True
+
+    except Exception:
+        elapsed = time.perf_counter() - t0
+        return None, [], elapsed, False
+
+
+def iter_examples_local(ds, limit: Optional[int] = None) -> Iterator[dict]:
+    n = 0
+    for ex in ds:
+        if limit is not None and n >= limit:
+            break
+        yield {"article_id": ex["article_id"], "article": ex["article"]}
+        n += 1
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    conn = sqlite3.connect(SQLITE_PATH)
+    init_db(conn)
+
+    embedder, tokenizer, device = embcfg.build_embedder()  # uses embedder_st.py config
+    embedding_dim = int(embedder.get_sentence_embedding_dimension())
+    parquet_schema = make_parquet_schema(embedding_dim)
+
+    recover_staging_if_present(parquet_schema)
+
+    if year_done(conn, YEAR):
+        print(f"Year {YEAR} already marked complete in {SQLITE_PATH}. Nothing to do.")
+        conn.close()
+        return
+
+    articles = american_stories_local(YEAR)
+    ex_iter = iter_examples_local(articles, limit=DOC_LIMIT)
+
+    if os.path.exists(PARQUET_STAGING_PATH):
+        raise RuntimeError(
+            f"Staging file still exists after recovery: {PARQUET_STAGING_PATH}. "
+            "Rename or delete it manually, or check recovery logs."
+        )
+    staging_writer = pq.ParquetWriter(
+        PARQUET_STAGING_PATH, schema=parquet_schema, compression=PARQUET_COMPRESSION
+    )
+
+    # Stats
+    n_docs = 0
+    n_errors = 0
+    total_worker_time = 0.0
+
+    total_tokens_embedded = 0
+    n_chunks_embedded = 0
+    n_articles_marked_done = 0
+    n_articles_skipped = 0
+
+    # Buffer for embedding batches:
+    # (article_id, chunk_id, chunk_text, is_last_for_article)
+    chunk_buffer: List[Tuple[str, int, str, bool]] = []
+
+    def flush():
+        nonlocal chunk_buffer, total_tokens_embedded, n_chunks_embedded, n_articles_marked_done
+
+        if not chunk_buffer:
+            return
+
+        texts = [t[2] for t in chunk_buffer]
+        total_tokens_embedded += embcfg.count_tokens_batch(tokenizer, texts)
+
+        emb = embcfg.embed_texts(
+            embedder,
+            texts,
+            batch_size=embcfg.BATCH_SIZE,
+            normalize_embeddings=embcfg.NORMALIZE_EMBEDDINGS,
+            convert_to_numpy=True,
+        )
+        if emb.ndim != 2 or emb.shape[1] != embedding_dim:
+            raise RuntimeError(f"Unexpected embedding shape: {getattr(emb, 'shape', None)}")
+
+        article_ids = [t[0] for t in chunk_buffer]
+        chunk_ids = [int(t[1]) for t in chunk_buffer]
+        chunk_texts = [t[2] for t in chunk_buffer]
+
+        write_batch_to_staging(
+            staging_writer,
+            article_ids=article_ids,
+            chunk_ids=chunk_ids,
+            chunk_texts=chunk_texts,
+            emb=emb,
+            embedding_dim=embedding_dim,
+        )
+
+        n_chunks_embedded += len(texts)
+
+        done_article_ids = [aid for (aid, _cid, _txt, is_last) in chunk_buffer if is_last]
+        if done_article_ids:
+            mark_articles_done(conn, YEAR, done_article_ids)
+            n_articles_marked_done += len(set(done_article_ids))  # approx
+
+        chunk_buffer = []
+
+    run_start = time.perf_counter()
+
+    with Pool(
+        processes=N_PROCESSES,
+        initializer=init_worker,
+        initargs=(WINDOW_SENTENCES, STRIDE_SENTENCES),
+    ) as pool:
+        for article_id, chunk_texts, elapsed, ok in pool.imap_unordered(
+            process_article, ex_iter, chunksize=POOL_CHUNKSIZE
+        ):
+            n_docs += 1
+            total_worker_time += elapsed
+
+            if not ok or article_id is None:
+                n_errors += 1
+                continue
+
+            if article_done(conn, YEAR, article_id):
+                n_articles_skipped += 1
+                continue
+
+            kept: List[Tuple[str, int, str]] = []
+            article_chunk_id = 0
+            for chunk_text in chunk_texts:
+                if MIN_CHUNK_WORDS and count_words_fast(chunk_text) < MIN_CHUNK_WORDS:
+                    continue
+                kept.append((article_id, article_chunk_id, chunk_text))
+                article_chunk_id += 1
+
+            if not kept:
+                mark_articles_done(conn, YEAR, [article_id])
+                n_articles_marked_done += 1
+                continue
+
+            last_idx = len(kept) - 1
+            for i, (aid, cid, txt) in enumerate(kept):
+                is_last = (i == last_idx)
+                chunk_buffer.append((aid, cid, txt, is_last))
+
+                if len(chunk_buffer) >= embcfg.BATCH_SIZE:
+                    flush()
+
+            if PROGRESS_EVERY and (n_docs % PROGRESS_EVERY == 0):
+                if chunk_buffer:
+                    flush()
+
+                wall_elapsed = time.perf_counter() - run_start
+                toks_per_s = total_tokens_embedded / wall_elapsed if wall_elapsed > 0 else 0.0
+                print(
+                    f"[{n_docs}] {toks_per_s:,.1f} tokens/sec | "
+                    f"chunks={n_chunks_embedded:,} | "
+                    f"done={n_articles_marked_done:,} | skipped={n_articles_skipped:,} | "
+                    f"errors={n_errors:,}"
+                )
+
+    if chunk_buffer:
+        flush()
+
+    staging_writer.close()
+
+    merge_upsert_parquet(PARQUET_PATH, PARQUET_STAGING_PATH, parquet_schema)
+
+    if DOC_LIMIT is None:
+        mark_year_done(conn, YEAR)
+        year_status = "complete (marked)"
+    else:
+        year_status = "NOT marked (DOC_LIMIT set)"
+
+    wall_clock = time.perf_counter() - run_start
+    toks_per_s = total_tokens_embedded / wall_clock if wall_clock > 0 else 0.0
+    effective_parallelism = (total_worker_time / wall_clock) if wall_clock > 0 else 0.0
+
+    print("\n=== Chunking + Embedding + Parquet (tokens/sec) ===")
+    print(f"DB: {SQLITE_PATH}")
+    print(f"Parquet: {PARQUET_PATH}")
+    print(f"Year: {YEAR} -> {year_status}")
+    print(f"Model: {embcfg.MODEL_NAME} (dim={embedding_dim})")
+    print(f"Device: {device}")
+    print(f"Processes: {N_PROCESSES} | pool chunksize: {POOL_CHUNKSIZE}")
+    print(f"Window: {WINDOW_SENTENCES} | Stride: {STRIDE_SENTENCES} | Min chunk words: {MIN_CHUNK_WORDS}")
+    print(f"Docs processed: {n_docs:,} (errors: {n_errors:,})")
+    print(f"Articles skipped (already done): {n_articles_skipped:,}")
+    print(f"Articles marked done (approx):  {n_articles_marked_done:,}")
+    print(f"Chunks embedded (this run): {n_chunks_embedded:,}")
+    print(f"Total tokens embedded (this run): {total_tokens_embedded:,}")
+    print(f"Wall-clock time: {wall_clock:,.3f} s")
+    print(f"Throughput: {toks_per_s:,.1f} tokens/sec")
+    print(f"Effective parallelism (chunking): {effective_parallelism:,.2f}x")
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
