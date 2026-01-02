@@ -78,11 +78,10 @@ if __name__ == "__main__":
 
     articles = american_stories_local(1871)
 
-    text = articles[56]["article"]
+    text = articles[133]["article"]
+    print(text)
     text = unidecode(text)
     text = collapse_whitespace(text)
-
-    print(text)
 
     sentences = spacy_sentences(text, nlp=nlp)
 

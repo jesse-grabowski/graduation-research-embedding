@@ -1,4 +1,5 @@
 import re
+import difflib
 from typing import Iterable, List, Tuple, Optional
 from collections import deque
 from dataclasses import dataclass
@@ -9,14 +10,9 @@ from symspellpy import SymSpell, Verbosity
 # PRODUCTION INITIALIZER
 # -----------------------------------------------------------------------------
 #
-# Goal: avoid import-time heavy work and allow clean per-process initialization
-# (e.g., multiprocessing, Ray workers). Behavior should match your current code.
-#
 # Usage:
 #   init_spellchecker(word_dicts=[...], bigram_dicts=[...])
 #   fixed, stats = fix_spelling(text)
-#
-# If you forget to call init_spellchecker(), fix_spelling() raises clearly.
 # -----------------------------------------------------------------------------
 
 # Globals set by init_spellchecker()
@@ -115,14 +111,7 @@ def generate_substitution_variants(
     rules: List[Tuple[str, str]],
     max_subs: int = 2
 ) -> Iterable[str]:
-    """
-    Generate variants with up to max_subs substitutions using BFS.
-    Behavior matches your current implementation.
-
-    Micro-opts:
-      - local bindings for speed
-      - avoid repeated attribute lookups
-    """
+    """Generate variants with up to max_subs substitutions using BFS."""
     visited = {word}
     q = deque([(word, 0)])
     visited_add = visited.add
@@ -204,23 +193,63 @@ def fix_word(
 
 
 # -----------------------------------------------------------------------------
-# Stats (Option A: final denom uses final word count)
+# Stats
 # -----------------------------------------------------------------------------
 
 @dataclass
 class FixStats:
+    # Word tokens in the ORIGINAL input text
     original_words: int = 0
-    changed_words: int = 0
+
+    # Stage-1 changes only (word-by-word)
+    first_pass_changed_words: int = 0
+
+    # Final token-diff based metrics (includes merges + compound)
+    changed_original_words: int = 0   # how many original word tokens were replaced/deleted
+    inserted_final_words: int = 0     # how many final word tokens were inserted
+
+    # Final counts
     final_words: int = 0
     final_in_dict_words: int = 0
 
     @property
     def percent_changed(self) -> float:
-        return 0.0 if self.original_words == 0 else (self.changed_words / self.original_words)
+        # fraction of ORIGINAL word tokens that changed (replace/delete)
+        return 0.0 if self.original_words == 0 else (self.changed_original_words / self.original_words)
 
     @property
     def final_in_dict_fraction(self) -> float:
         return 0.0 if self.final_words == 0 else (self.final_in_dict_words / self.final_words)
+
+
+def _word_tokens_lower(text: str) -> List[str]:
+    return [t.lower() for t in WORD_TOKEN_FULL_RE.findall(text)]
+
+
+def _compute_token_diff_stats(original_text: str, final_text: str) -> Tuple[int, int, int, int]:
+    """
+    Returns:
+      original_words, final_words, changed_original_words, inserted_final_words
+    """
+    orig = _word_tokens_lower(original_text)
+    fin = _word_tokens_lower(final_text)
+
+    sm = difflib.SequenceMatcher(a=orig, b=fin)
+    changed_orig = 0
+    inserted_fin = 0
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "replace":
+            changed_orig += (i2 - i1)
+            inserted_fin += (j2 - j1)
+        elif tag == "delete":
+            changed_orig += (i2 - i1)
+        elif tag == "insert":
+            inserted_fin += (j2 - j1)
+
+    return len(orig), len(fin), changed_orig, inserted_fin
 
 
 # -----------------------------------------------------------------------------
@@ -228,7 +257,7 @@ class FixStats:
 # -----------------------------------------------------------------------------
 
 def fix_text_with_stats(text: str, *, use_symspell_fallback: bool = True):
-    sym = _require_init()
+    _require_init()
     out: List[str] = []
     out_append = out.append
 
@@ -239,7 +268,7 @@ def fix_text_with_stats(text: str, *, use_symspell_fallback: bool = True):
             stats.original_words += 1
             fixed = fix_word(token, use_symspell_fallback=use_symspell_fallback)
             if fixed != token:
-                stats.changed_words += 1
+                stats.first_pass_changed_words += 1
             out_append(fixed)
         else:
             out_append(token)
@@ -254,7 +283,6 @@ def fix_text_with_stats(text: str, *, use_symspell_fallback: bool = True):
 # -----------------------------------------------------------------------------
 
 def _is_proper_noun_token(tok: str) -> bool:
-    # Faster than tok[0].isupper() while preserving behavior for your token set.
     return bool(tok) and bool(PROPER_NOUN_RE.match(tok))
 
 
@@ -297,6 +325,86 @@ def _count_final_words(text: str):
 
 
 # -----------------------------------------------------------------------------
+# Targeted merge pass for split words (place names etc.)
+# -----------------------------------------------------------------------------
+
+def _looks_like_word(tok: str) -> bool:
+    return bool(WORD_TOKEN_FULL_RE.fullmatch(tok))
+
+
+def _merge_case_from_left(left: str, merged_lower: str) -> str:
+    # Preserve the left token’s casing style (common for place names)
+    if left.isupper():
+        return merged_lower.upper()
+    if left.istitle():
+        return merged_lower.title()
+    return merged_lower
+
+
+def merge_split_words(tokens: List[str], *, max_symspell_edit_distance: int = 0) -> List[str]:
+    """
+    Merge patterns like:
+      - "Eng" + " " + "land" -> "England" (if in dict)
+      - "Lancas'" + " " + "ter" -> "Lancaster" (if in dict)
+
+    Only merges if merged candidate is in dictionary (safe).
+    Optionally also allow SymSpell TOP with edit distance 0 (default) for dictionary gaps.
+    """
+    sym = _require_init()
+    out: List[str] = []
+    i = 0
+    n = len(tokens)
+
+    while i < n:
+        if (
+            i + 2 < n
+            and _looks_like_word(tokens[i])
+            and tokens[i + 1].isspace()
+            and _looks_like_word(tokens[i + 2])
+        ):
+            w1 = tokens[i]
+            ws = tokens[i + 1]
+            w2 = tokens[i + 2]
+
+            cand1 = w1 + w2
+            cand2 = (w1[:-1] + w2) if w1.endswith("'") else None
+
+            chosen_lower: Optional[str] = None
+
+            c1l = cand1.lower()
+            if c1l in sym.words:
+                chosen_lower = c1l
+            elif cand2 is not None and cand2.lower() in sym.words:
+                chosen_lower = cand2.lower()
+            else:
+                if max_symspell_edit_distance == 0:
+                    sug = sym.lookup(c1l, Verbosity.TOP, max_edit_distance=0)
+                    if sug and sug[0].term == c1l:
+                        chosen_lower = c1l
+                    elif cand2 is not None:
+                        c2l = cand2.lower()
+                        sug2 = sym.lookup(c2l, Verbosity.TOP, max_edit_distance=0)
+                        if sug2 and sug2[0].term == c2l:
+                            chosen_lower = c2l
+
+            if chosen_lower is not None:
+                out.append(_merge_case_from_left(w1, chosen_lower))
+                i += 3
+                continue
+
+            # no merge: emit w1 + ws and continue from w2
+            out.append(w1)
+            out.append(ws)
+            i += 2
+            continue
+
+        out.append(tokens[i])
+        i += 1
+
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Full pipeline
 # -----------------------------------------------------------------------------
 
@@ -309,7 +417,8 @@ def fix_spelling(
     """
     Pipeline:
       1) word-by-word pass (substitutions + optional SymSpell lookup)
-      2) SymSpell lookup_compound() pass for spacing/squishing (uses bigrams)
+      2) targeted merge of split tokens: "Eng land" -> "England", "Lancas' ter" -> "Lancaster"
+      3) SymSpell lookup_compound() pass for spacing/squishing (uses bigrams)
          - punctuation preserved by not including it in compound spans
          - proper nouns protected by treating Capitalized tokens as hard boundaries
 
@@ -321,6 +430,9 @@ def fix_spelling(
 
     tokens = TOKEN_RE2.findall(first)
 
+    # Merge common split-word artifacts safely before compound
+    tokens = merge_split_words(tokens, max_symspell_edit_distance=0)
+
     out: List[str] = []
     out_append = out.append
     buf: List[str] = []
@@ -330,7 +442,7 @@ def fix_spelling(
             return
         span = "".join(buf)
 
-        # Heuristic: only run compound when span has spaces or a long squished token
+        # only run compound when span has spaces or a long squished token
         if (" " in span) or LONG_SQUISHED_RE.search(span):
             out_append(_compound_span_preserve_ws(span, compound_max_edit_distance))
         else:
@@ -354,7 +466,16 @@ def fix_spelling(
     flush_buf()
     final_text = "".join(out)
 
+    # Final in-dictionary coverage
     stats.final_words, stats.final_in_dict_words = _count_final_words(final_text)
+
+    # NEW: true change tracking vs original input (includes merges/compound)
+    ow, fw, changed_orig, inserted_fw = _compute_token_diff_stats(text, final_text)
+    stats.original_words = ow
+    stats.final_words = fw
+    stats.changed_original_words = changed_orig
+    stats.inserted_final_words = inserted_fw
+
     return final_text, stats
 
 
@@ -379,17 +500,22 @@ if __name__ == "__main__":
         max_edit_distance=2,
         prefix_length=7,
         max_substitutions=2,
-        # sub_rules=DEFAULT_SUB_RULES,  # optionally override
+        # sub_rules=DEFAULT_SUB_RULES,
     )
 
     s = (
         "Why, it but this day as was pafing the Temple, "
         "Iickepo came up TO me, and infolenty accofed me with, "
-        "Brother, what number 90"
+        "Brother, what number 90. "
+        "I traveled in New Eng land last year. "
+        "We also visited Lancas' ter and had tea."
     )
 
     fixed, stats = fix_spelling(s)
 
     print(fixed)
+    print(f"Stage-1 changed words: {stats.first_pass_changed_words}")
+    print(f"Changed original words (final diff): {stats.changed_original_words}")
+    print(f"Inserted final words (final diff): {stats.inserted_final_words}")
     print(f"Percent changed: {stats.percent_changed:.4f}")
     print(f"Final in-dictionary fraction: {stats.final_in_dict_fraction:.4f}")
