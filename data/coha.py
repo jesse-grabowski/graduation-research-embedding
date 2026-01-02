@@ -44,6 +44,9 @@ for path in glob.glob(os.path.join(DIR, "*.txt")):
             if letters_len(w1) + letters_len(w2) < 4:
                 continue
 
+            if "-" in w1 or "-" in w2:
+                continue
+
             bigram_freq[(w1, w2)] += freq
 
             # words can be part of bigrams even if <4 chars; we just won't SAVE them later
