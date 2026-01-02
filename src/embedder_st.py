@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -16,7 +16,7 @@ from sentence_transformers import SentenceTransformer
 # ============================================================
 
 # Model choice
-MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_NAME: str = "Qwen/Qwen3-Embedding-4B"
 
 # Embedding options
 BATCH_SIZE: int = 64
@@ -26,6 +26,22 @@ NORMALIZE_EMBEDDINGS: bool = True
 # - None => auto-detect (cuda > mps > cpu)
 # - Or set to "cpu" / "mps" / "cuda"
 FORCE_DEVICE: Optional[str] = None
+
+# Optional: enable extra HF kwargs when running on CUDA.
+# These are only applied if `device == "cuda"`.
+ENABLE_CUDA_EXTRA_KWARGS: bool = True
+
+# Passed through to SentenceTransformer(...) when CUDA is used.
+# Note: These require a Transformers backend/model that supports them.
+CUDA_MODEL_KWARGS: dict[str, Any] = {
+    "attn_implementation": "flash_attention_2",
+    "device_map": "auto",
+}
+
+# Passed through to SentenceTransformer(...) when CUDA is used.
+TOKENIZER_KWARGS: dict[str, Any] = {
+    "padding_side": "left",
+}
 
 
 # ============================================================
@@ -62,7 +78,10 @@ def get_device() -> str:
 # Model + tokenizer
 # ============================================================
 
-def build_embedder(model_name: Optional[str] = None, device: Optional[str] = None) -> tuple[SentenceTransformer, Any, str]:
+def build_embedder(
+    model_name: Optional[str] = None,
+    device: Optional[str] = None,
+) -> tuple[SentenceTransformer, Any, str]:
     """
     Build a SentenceTransformer model + its tokenizer.
 
@@ -76,7 +95,14 @@ def build_embedder(model_name: Optional[str] = None, device: Optional[str] = Non
     model_name = model_name or MODEL_NAME
     device = device or get_device()
 
-    model = SentenceTransformer(model_name, device=device)
+    extra_kwargs: dict[str, Any] = {}
+    extra_kwargs["tokenizer_kwargs"] = TOKENIZER_KWARGS
+
+    # Extra kwargs only when on CUDA (opt-in)
+    if ENABLE_CUDA_EXTRA_KWARGS and device == "cuda":
+        extra_kwargs["model_kwargs"] = CUDA_MODEL_KWARGS
+
+    model = SentenceTransformer(model_name, device=device, truncate_dim=768, **extra_kwargs)
 
     tok = getattr(model, "tokenizer", None)
     if tok is None:
