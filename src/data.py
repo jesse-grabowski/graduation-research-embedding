@@ -69,8 +69,7 @@ if __name__ == "__main__":
             "../data/jrc-names-bigrams.txt",
         ],
         max_edit_distance=2,
-        prefix_length=7,
-        max_substitutions=2,
+        prefix_length=7
     )
 
     # Build spaCy pipeline once
@@ -88,4 +87,4 @@ if __name__ == "__main__":
     # printing dominates runtime; keep if you need it
     for sentence in sentences:
         fixed, stats = fix_spelling(sentence)
-        print(f"{stats.percent_changed:.2f}, {stats.final_in_dict_fraction:.2f}: ", fixed)
+        print(f"{stats.fraction_changed:.2f}: ", fixed)
