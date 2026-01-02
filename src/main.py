@@ -1,6 +1,7 @@
 # bench_mp.py
 # preprocess -> spellcheck -> sentencize -> chunk (mp) -> embed (main process) -> write Parquet
-# Reports ONLY tokens/sec (wall-clock).
+# Processes YEARS sequentially from years.txt (one year per line).
+# Reports ONLY tokens/sec (wall-clock) per-year.
 #
 # SQLite tracking:
 # - embedded_articles(year, article_id) marks an article done
@@ -33,7 +34,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import embedder_st as embcfg  # <- all embedding model knobs live here
+import embedder_st as embcfg  # embedding model knobs live here
 
 from spellcheck import init_spellchecker, fix_spelling
 from sentencizer import build_nlp, spacy_sentences
@@ -44,7 +45,7 @@ from data import american_stories_local
 # CONFIGURATION (edit here)
 # ============================================================
 
-YEAR = 1800
+YEARS_FILE = "years.txt"   # one year per line, comments allowed with '#'
 
 # Multiprocessing (chunking)
 N_PROCESSES = cpu_count()
@@ -63,8 +64,6 @@ MIN_CHUNK_WORDS = 16
 SQLITE_PATH = "embedded_progress.sqlite"
 
 # Parquet output
-PARQUET_PATH = f"{YEAR}.parquet"
-PARQUET_STAGING_PATH = f"{YEAR}.staging.parquet"
 PARQUET_COMPRESSION = "zstd"  # good speed/size tradeoff
 
 # ============================================================
@@ -73,6 +72,38 @@ PARQUET_COMPRESSION = "zstd"  # good speed/size tradeoff
 _NLP = None
 _WINDOW_SENTENCES = WINDOW_SENTENCES
 _STRIDE_SENTENCES = STRIDE_SENTENCES
+
+
+# ============================================================
+# Years file
+# ============================================================
+
+def read_years(path: str) -> List[int]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Years file not found: {path}")
+
+    years: List[int] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                continue
+            # allow inline comments
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+            try:
+                y = int(line)
+                years.append(y)
+            except ValueError:
+                raise ValueError(f"Invalid year in {path!r}: {raw!r}")
+
+    if not years:
+        raise ValueError(f"No years found in {path}")
+    return years
 
 
 # ============================================================
@@ -141,7 +172,6 @@ def mark_articles_done(conn: sqlite3.Connection, year: int, article_ids: List[st
 # ============================================================
 
 def make_parquet_schema(embedding_dim: int) -> pa.Schema:
-    # Fixed-size list type via list_(..., list_size=dim) (compatible across pyarrow versions)
     return pa.schema([
         ("article_id", pa.string()),
         ("chunk_id", pa.int32()),
@@ -178,10 +208,6 @@ def write_batch_to_staging(
 
 
 def merge_upsert_parquet(final_path: str, staging_path: str, schema: pa.Schema) -> None:
-    """
-    Upsert semantics for Parquet by rewriting:
-      final = dedupe(concat(existing, staging), key=(article_id, chunk_id), keep="last")
-    """
     if not os.path.exists(staging_path):
         return
 
@@ -217,23 +243,23 @@ def merge_upsert_parquet(final_path: str, staging_path: str, schema: pa.Schema) 
     os.remove(staging_path)
 
 
-def recover_staging_if_present(schema: pa.Schema) -> None:
-    if not os.path.exists(PARQUET_STAGING_PATH):
+def recover_staging_if_present(year: int, parquet_path: str, staging_path: str, schema: pa.Schema) -> None:
+    if not os.path.exists(staging_path):
         return
 
-    print(f"Found existing staging file: {PARQUET_STAGING_PATH} -> attempting recovery merge...")
+    print(f"[{year}] Found existing staging file: {staging_path} -> attempting recovery merge...")
     try:
-        merge_upsert_parquet(PARQUET_PATH, PARQUET_STAGING_PATH, schema)
-        print("Recovery merge succeeded.")
+        merge_upsert_parquet(parquet_path, staging_path, schema)
+        print(f"[{year}] Recovery merge succeeded.")
     except Exception as e:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        corrupt_path = f"{YEAR}.staging.corrupt.{ts}.parquet"
+        corrupt_path = f"{year}.staging.corrupt.{ts}.parquet"
         try:
-            os.replace(PARQUET_STAGING_PATH, corrupt_path)
+            os.replace(staging_path, corrupt_path)
         except Exception:
-            corrupt_path = PARQUET_STAGING_PATH
-        print(f"Recovery merge failed; staging renamed to: {corrupt_path}")
-        print(f"Error: {e}")
+            corrupt_path = staging_path
+        print(f"[{year}] Recovery merge failed; staging renamed to: {corrupt_path}")
+        print(f"[{year}] Error: {e}")
 
 
 # ============================================================
@@ -325,35 +351,40 @@ def iter_examples_local(ds, limit: Optional[int] = None) -> Iterator[dict]:
 
 
 # ============================================================
-# Main
+# Per-year run
 # ============================================================
 
-def main():
-    conn = sqlite3.connect(SQLITE_PATH)
-    init_db(conn)
+def run_year(
+    year: int,
+    conn: sqlite3.Connection,
+    embedder,
+    tokenizer,
+    embedding_dim: int,
+    parquet_schema: pa.Schema,
+    pool: Pool,
+) -> None:
+    parquet_path = f"{year}.parquet"
+    staging_path = f"{year}.staging.parquet"
 
-    embedder, tokenizer, device = embcfg.build_embedder()  # uses embedder_st.py config
-    embedding_dim = int(embedder.get_sentence_embedding_dimension())
-    parquet_schema = make_parquet_schema(embedding_dim)
+    # Crash recovery per-year (before checking year_done)
+    recover_staging_if_present(year, parquet_path, staging_path, parquet_schema)
 
-    recover_staging_if_present(parquet_schema)
-
-    if year_done(conn, YEAR):
-        print(f"Year {YEAR} already marked complete in {SQLITE_PATH}. Nothing to do.")
-        conn.close()
+    if year_done(conn, year):
+        print(f"[{year}] already marked complete in {SQLITE_PATH}. Skipping.")
         return
 
-    articles = american_stories_local(YEAR)
+    # If staging still exists, refuse to proceed (means recovery couldn't resolve)
+    if os.path.exists(staging_path):
+        raise RuntimeError(
+            f"[{year}] staging file still exists after recovery: {staging_path}. "
+            "Rename/delete it or inspect the corrupt staging file."
+        )
+
+    # Load dataset
+    articles = american_stories_local(year)
     ex_iter = iter_examples_local(articles, limit=DOC_LIMIT)
 
-    if os.path.exists(PARQUET_STAGING_PATH):
-        raise RuntimeError(
-            f"Staging file still exists after recovery: {PARQUET_STAGING_PATH}. "
-            "Rename or delete it manually, or check recovery logs."
-        )
-    staging_writer = pq.ParquetWriter(
-        PARQUET_STAGING_PATH, schema=parquet_schema, compression=PARQUET_COMPRESSION
-    )
+    staging_writer = pq.ParquetWriter(staging_path, schema=parquet_schema, compression=PARQUET_COMPRESSION)
 
     # Stats
     n_docs = 0
@@ -386,7 +417,7 @@ def main():
             convert_to_numpy=True,
         )
         if emb.ndim != 2 or emb.shape[1] != embedding_dim:
-            raise RuntimeError(f"Unexpected embedding shape: {getattr(emb, 'shape', None)}")
+            raise RuntimeError(f"[{year}] Unexpected embedding shape: {getattr(emb, 'shape', None)}")
 
         article_ids = [t[0] for t in chunk_buffer]
         chunk_ids = [int(t[1]) for t in chunk_buffer]
@@ -405,75 +436,73 @@ def main():
 
         done_article_ids = [aid for (aid, _cid, _txt, is_last) in chunk_buffer if is_last]
         if done_article_ids:
-            mark_articles_done(conn, YEAR, done_article_ids)
+            mark_articles_done(conn, year, done_article_ids)
             n_articles_marked_done += len(set(done_article_ids))  # approx
 
         chunk_buffer = []
 
     run_start = time.perf_counter()
 
-    with Pool(
-        processes=N_PROCESSES,
-        initializer=init_worker,
-        initargs=(WINDOW_SENTENCES, STRIDE_SENTENCES),
-    ) as pool:
-        for article_id, chunk_texts, elapsed, ok in pool.imap_unordered(
-            process_article, ex_iter, chunksize=POOL_CHUNKSIZE
-        ):
-            n_docs += 1
-            total_worker_time += elapsed
+    # Consume worker results from shared pool
+    for article_id, chunk_texts, elapsed, ok in pool.imap_unordered(
+        process_article, ex_iter, chunksize=POOL_CHUNKSIZE
+    ):
+        n_docs += 1
+        total_worker_time += elapsed
 
-            if not ok or article_id is None:
-                n_errors += 1
+        if not ok or article_id is None:
+            n_errors += 1
+            continue
+
+        if article_done(conn, year, article_id):
+            n_articles_skipped += 1
+            continue
+
+        kept: List[Tuple[str, int, str]] = []
+        article_chunk_id = 0
+        for chunk_text in chunk_texts:
+            if MIN_CHUNK_WORDS and count_words_fast(chunk_text) < MIN_CHUNK_WORDS:
                 continue
+            kept.append((article_id, article_chunk_id, chunk_text))
+            article_chunk_id += 1
 
-            if article_done(conn, YEAR, article_id):
-                n_articles_skipped += 1
-                continue
+        if not kept:
+            mark_articles_done(conn, year, [article_id])
+            n_articles_marked_done += 1
+            continue
 
-            kept: List[Tuple[str, int, str]] = []
-            article_chunk_id = 0
-            for chunk_text in chunk_texts:
-                if MIN_CHUNK_WORDS and count_words_fast(chunk_text) < MIN_CHUNK_WORDS:
-                    continue
-                kept.append((article_id, article_chunk_id, chunk_text))
-                article_chunk_id += 1
+        last_idx = len(kept) - 1
+        for i, (aid, cid, txt) in enumerate(kept):
+            is_last = (i == last_idx)
+            chunk_buffer.append((aid, cid, txt, is_last))
 
-            if not kept:
-                mark_articles_done(conn, YEAR, [article_id])
-                n_articles_marked_done += 1
-                continue
+            if len(chunk_buffer) >= embcfg.BATCH_SIZE:
+                flush()
 
-            last_idx = len(kept) - 1
-            for i, (aid, cid, txt) in enumerate(kept):
-                is_last = (i == last_idx)
-                chunk_buffer.append((aid, cid, txt, is_last))
+        if PROGRESS_EVERY and (n_docs % PROGRESS_EVERY == 0):
+            if chunk_buffer:
+                flush()
 
-                if len(chunk_buffer) >= embcfg.BATCH_SIZE:
-                    flush()
-
-            if PROGRESS_EVERY and (n_docs % PROGRESS_EVERY == 0):
-                if chunk_buffer:
-                    flush()
-
-                wall_elapsed = time.perf_counter() - run_start
-                toks_per_s = total_tokens_embedded / wall_elapsed if wall_elapsed > 0 else 0.0
-                print(
-                    f"[{n_docs}] {toks_per_s:,.1f} tokens/sec | "
-                    f"chunks={n_chunks_embedded:,} | "
-                    f"done={n_articles_marked_done:,} | skipped={n_articles_skipped:,} | "
-                    f"errors={n_errors:,}"
-                )
+            wall_elapsed = time.perf_counter() - run_start
+            toks_per_s = total_tokens_embedded / wall_elapsed if wall_elapsed > 0 else 0.0
+            print(
+                f"[{year} | {n_docs}] {toks_per_s:,.1f} tokens/sec | "
+                f"chunks={n_chunks_embedded:,} | "
+                f"done={n_articles_marked_done:,} | skipped={n_articles_skipped:,} | "
+                f"errors={n_errors:,}"
+            )
 
     if chunk_buffer:
         flush()
 
     staging_writer.close()
 
-    merge_upsert_parquet(PARQUET_PATH, PARQUET_STAGING_PATH, parquet_schema)
+    # Merge staging into final parquet (upsert)
+    merge_upsert_parquet(parquet_path, staging_path, parquet_schema)
 
+    # Mark year complete only if full run
     if DOC_LIMIT is None:
-        mark_year_done(conn, YEAR)
+        mark_year_done(conn, year)
         year_status = "complete (marked)"
     else:
         year_status = "NOT marked (DOC_LIMIT set)"
@@ -482,12 +511,12 @@ def main():
     toks_per_s = total_tokens_embedded / wall_clock if wall_clock > 0 else 0.0
     effective_parallelism = (total_worker_time / wall_clock) if wall_clock > 0 else 0.0
 
-    print("\n=== Chunking + Embedding + Parquet (tokens/sec) ===")
+    print(f"\n=== [{year}] Chunking + Embedding + Parquet (tokens/sec) ===")
     print(f"DB: {SQLITE_PATH}")
-    print(f"Parquet: {PARQUET_PATH}")
-    print(f"Year: {YEAR} -> {year_status}")
+    print(f"Parquet: {parquet_path}")
+    print(f"Year: {year} -> {year_status}")
     print(f"Model: {embcfg.MODEL_NAME} (dim={embedding_dim})")
-    print(f"Device: {device}")
+    print(f"Device: {embcfg.get_device()}")
     print(f"Processes: {N_PROCESSES} | pool chunksize: {POOL_CHUNKSIZE}")
     print(f"Window: {WINDOW_SENTENCES} | Stride: {STRIDE_SENTENCES} | Min chunk words: {MIN_CHUNK_WORDS}")
     print(f"Docs processed: {n_docs:,} (errors: {n_errors:,})")
@@ -497,7 +526,46 @@ def main():
     print(f"Total tokens embedded (this run): {total_tokens_embedded:,}")
     print(f"Wall-clock time: {wall_clock:,.3f} s")
     print(f"Throughput: {toks_per_s:,.1f} tokens/sec")
-    print(f"Effective parallelism (chunking): {effective_parallelism:,.2f}x")
+    print(f"Effective parallelism (chunking): {effective_parallelism:,.2f}x\n")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    years = read_years(YEARS_FILE)
+
+    conn = sqlite3.connect(SQLITE_PATH)
+    init_db(conn)
+
+    # Build embedding model once and reuse across all years
+    embedder, tokenizer, device = embcfg.build_embedder()
+    embedding_dim = int(embedder.get_sentence_embedding_dimension())
+    parquet_schema = make_parquet_schema(embedding_dim)
+
+    print(f"Years file: {YEARS_FILE} ({len(years)} years)")
+    print(f"Model: {embcfg.MODEL_NAME} (dim={embedding_dim})")
+    print(f"Device: {device}")
+    print(f"Processes: {N_PROCESSES} | pool chunksize: {POOL_CHUNKSIZE}")
+    print()
+
+    # Create ONE pool and reuse across all years (saves spaCy/SymSpell init costs)
+    with Pool(
+        processes=N_PROCESSES,
+        initializer=init_worker,
+        initargs=(WINDOW_SENTENCES, STRIDE_SENTENCES),
+    ) as pool:
+        for year in years:
+            run_year(
+                year=year,
+                conn=conn,
+                embedder=embedder,
+                tokenizer=tokenizer,
+                embedding_dim=embedding_dim,
+                parquet_schema=parquet_schema,
+                pool=pool,
+            )
 
     conn.close()
 

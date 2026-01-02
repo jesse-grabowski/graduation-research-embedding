@@ -19,11 +19,11 @@ import embedder_st as embcfg
 # CONFIG (edit here)
 # ============================================================
 
-YEAR = 1800
+YEAR = 1770
 PARQUET_PATH = f"{YEAR}.parquet"
 
 TOP_N = 10
-QUERY_TEXT = "human trafficking, slavery, forced labor"
+QUERY_TEXT = "sailing, boats"
 
 # How many rows to scan per Parquet batch (memory/speed tradeoff)
 BATCH_ROWS = 50_000
