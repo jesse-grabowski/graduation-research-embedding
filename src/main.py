@@ -30,6 +30,8 @@ from datetime import datetime
 from multiprocessing import Pool, cpu_count
 from typing import Iterator, List, Optional, Tuple
 from pathlib import Path
+from dataclasses import dataclass
+from contextlib import contextmanager
 
 import numpy as np
 import pyarrow as pa
@@ -78,8 +80,42 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 SQLITE_PATH = str(OUT_DIR / "embedded_progress.sqlite")
 
 # ============================================================
+# Metrics
+# ============================================================
+
+@dataclass
+class YearMetrics:
+    # Parquet
+    parquet_stage_write_s: float = 0.0
+    parquet_merge_s: float = 0.0
+    parquet_stage_batches: int = 0
+
+    # SQLite
+    sqlite_read_s: float = 0.0
+    sqlite_write_s: float = 0.0
+    sqlite_commits: int = 0
+    sqlite_reads: int = 0
+    sqlite_writes: int = 0
+
+    def total_parquet_s(self) -> float:
+        return self.parquet_stage_write_s + self.parquet_merge_s
+
+    def total_sqlite_s(self) -> float:
+        return self.sqlite_read_s + self.sqlite_write_s
+
+
+@contextmanager
+def timed(add_fn):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        add_fn(time.perf_counter() - t0)
+
+# ============================================================
 # Globals initialized per worker
 # ============================================================
+
 _NLP = None
 _WINDOW_SENTENCES = WINDOW_SENTENCES
 _STRIDE_SENTENCES = STRIDE_SENTENCES
@@ -147,35 +183,75 @@ def init_db(conn: sqlite3.Connection):
     conn.commit()
 
 
-def year_done(conn: sqlite3.Connection, year: int) -> bool:
-    cur = conn.execute("SELECT 1 FROM embedded_years WHERE year=?", (year,))
-    return cur.fetchone() is not None
+def year_done(conn: sqlite3.Connection, year: int, metrics: Optional[YearMetrics] = None) -> bool:
+    if metrics is None:
+        cur = conn.execute("SELECT 1 FROM embedded_years WHERE year=?", (year,))
+        return cur.fetchone() is not None
+
+    with timed(lambda dt: setattr(metrics, "sqlite_read_s", metrics.sqlite_read_s + dt)):
+        metrics.sqlite_reads += 1
+        cur = conn.execute("SELECT 1 FROM embedded_years WHERE year=?", (year,))
+        return cur.fetchone() is not None
 
 
-def mark_year_done(conn: sqlite3.Connection, year: int):
-    conn.execute("INSERT OR IGNORE INTO embedded_years(year) VALUES (?)", (year,))
-    conn.commit()
+def mark_year_done(conn: sqlite3.Connection, year: int, metrics: Optional[YearMetrics] = None):
+    if metrics is None:
+        conn.execute("INSERT OR IGNORE INTO embedded_years(year) VALUES (?)", (year,))
+        conn.commit()
+        return
+
+    with timed(lambda dt: setattr(metrics, "sqlite_write_s", metrics.sqlite_write_s + dt)):
+        metrics.sqlite_writes += 1
+        conn.execute("INSERT OR IGNORE INTO embedded_years(year) VALUES (?)", (year,))
+        conn.commit()
+        metrics.sqlite_commits += 1
 
 
-def article_done(conn: sqlite3.Connection, year: int, article_id: str) -> bool:
-    cur = conn.execute(
-        "SELECT 1 FROM embedded_articles WHERE year=? AND article_id=?",
-        (year, article_id),
-    )
-    return cur.fetchone() is not None
+def article_done(conn: sqlite3.Connection, year: int, article_id: str, metrics: Optional[YearMetrics] = None) -> bool:
+    if metrics is None:
+        cur = conn.execute(
+            "SELECT 1 FROM embedded_articles WHERE year=? AND article_id=?",
+            (year, article_id),
+        )
+        return cur.fetchone() is not None
+
+    with timed(lambda dt: setattr(metrics, "sqlite_read_s", metrics.sqlite_read_s + dt)):
+        metrics.sqlite_reads += 1
+        cur = conn.execute(
+            "SELECT 1 FROM embedded_articles WHERE year=? AND article_id=?",
+            (year, article_id),
+        )
+        return cur.fetchone() is not None
 
 
-def mark_articles_done(conn: sqlite3.Connection, year: int, article_ids: List[str]):
+def mark_articles_done(
+    conn: sqlite3.Connection,
+    year: int,
+    article_ids: List[str],
+    metrics: Optional[YearMetrics] = None,
+):
     if not article_ids:
         return
     uniq = list({aid for aid in article_ids if aid is not None})
     if not uniq:
         return
-    conn.executemany(
-        "INSERT OR IGNORE INTO embedded_articles(year, article_id) VALUES (?, ?)",
-        [(year, aid) for aid in uniq],
-    )
-    conn.commit()
+
+    if metrics is None:
+        conn.executemany(
+            "INSERT OR IGNORE INTO embedded_articles(year, article_id) VALUES (?, ?)",
+            [(year, aid) for aid in uniq],
+        )
+        conn.commit()
+        return
+
+    with timed(lambda dt: setattr(metrics, "sqlite_write_s", metrics.sqlite_write_s + dt)):
+        metrics.sqlite_writes += 1
+        conn.executemany(
+            "INSERT OR IGNORE INTO embedded_articles(year, article_id) VALUES (?, ?)",
+            [(year, aid) for aid in uniq],
+        )
+        conn.commit()
+        metrics.sqlite_commits += 1
 
 
 # ============================================================
@@ -198,6 +274,7 @@ def write_batch_to_staging(
     chunk_texts: List[str],
     emb: np.ndarray,
     embedding_dim: int,
+    metrics: Optional[YearMetrics] = None,
 ) -> None:
     if emb.dtype != np.float32:
         emb = emb.astype(np.float32, copy=False)
@@ -215,13 +292,18 @@ def write_batch_to_staging(
         [arr_article, arr_chunk, arr_text, arr_emb],
         names=["article_id", "chunk_id", "chunk_text", "embedding"],
     )
-    writer.write_table(table)
 
-
-def merge_upsert_parquet(final_path: str, staging_path: str, schema: pa.Schema) -> None:
-    if not os.path.exists(staging_path):
+    # Time the parquet write itself (includes Arrow->Parquet work in this call)
+    if metrics is None:
+        writer.write_table(table)
         return
 
+    with timed(lambda dt: setattr(metrics, "parquet_stage_write_s", metrics.parquet_stage_write_s + dt)):
+        writer.write_table(table)
+    metrics.parquet_stage_batches += 1
+
+
+def _merge_upsert_parquet_impl(final_path: str, staging_path: str, schema: pa.Schema) -> None:
     staging = pq.read_table(staging_path)
 
     if os.path.exists(final_path):
@@ -254,13 +336,31 @@ def merge_upsert_parquet(final_path: str, staging_path: str, schema: pa.Schema) 
     os.remove(staging_path)
 
 
-def recover_staging_if_present(year: int, parquet_path: str, staging_path: str, schema: pa.Schema) -> None:
+def merge_upsert_parquet(final_path: str, staging_path: str, schema: pa.Schema, metrics: Optional[YearMetrics] = None) -> None:
+    if not os.path.exists(staging_path):
+        return
+
+    if metrics is None:
+        _merge_upsert_parquet_impl(final_path, staging_path, schema)
+        return
+
+    with timed(lambda dt: setattr(metrics, "parquet_merge_s", metrics.parquet_merge_s + dt)):
+        _merge_upsert_parquet_impl(final_path, staging_path, schema)
+
+
+def recover_staging_if_present(
+    year: int,
+    parquet_path: str,
+    staging_path: str,
+    schema: pa.Schema,
+    metrics: Optional[YearMetrics] = None,
+) -> None:
     if not os.path.exists(staging_path):
         return
 
     print(f"[{year}] Found existing staging file: {staging_path} -> attempting recovery merge...")
     try:
-        merge_upsert_parquet(parquet_path, staging_path, schema)
+        merge_upsert_parquet(parquet_path, staging_path, schema, metrics=metrics)
         print(f"[{year}] Recovery merge succeeded.")
     except Exception as e:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -374,14 +474,16 @@ def run_year(
     parquet_schema: pa.Schema,
     pool: Pool,
 ) -> None:
+    metrics = YearMetrics()
+
     # NEW: out/<YEAR>.parquet etc.
     parquet_path = str(OUT_DIR / f"{year}.parquet")
     staging_path = str(OUT_DIR / f"{year}.staging.parquet")
 
     # Crash recovery per-year (before checking year_done)
-    recover_staging_if_present(year, parquet_path, staging_path, parquet_schema)
+    recover_staging_if_present(year, parquet_path, staging_path, parquet_schema, metrics=metrics)
 
-    if year_done(conn, year):
+    if year_done(conn, year, metrics=metrics):
         print(f"[{year}] already marked complete in {SQLITE_PATH}. Skipping.")
         return
 
@@ -442,13 +544,14 @@ def run_year(
             chunk_texts=chunk_texts,
             emb=emb,
             embedding_dim=embedding_dim,
+            metrics=metrics,
         )
 
         n_chunks_embedded += len(texts)
 
         done_article_ids = [aid for (aid, _cid, _txt, is_last) in chunk_buffer if is_last]
         if done_article_ids:
-            mark_articles_done(conn, year, done_article_ids)
+            mark_articles_done(conn, year, done_article_ids, metrics=metrics)
             n_articles_marked_done += len(set(done_article_ids))  # approx
 
         chunk_buffer = []
@@ -466,7 +569,7 @@ def run_year(
             n_errors += 1
             continue
 
-        if article_done(conn, year, article_id):
+        if article_done(conn, year, article_id, metrics=metrics):
             n_articles_skipped += 1
             continue
 
@@ -479,7 +582,7 @@ def run_year(
             article_chunk_id += 1
 
         if not kept:
-            mark_articles_done(conn, year, [article_id])
+            mark_articles_done(conn, year, [article_id], metrics=metrics)
             n_articles_marked_done += 1
             continue
 
@@ -510,11 +613,11 @@ def run_year(
     staging_writer.close()
 
     # Merge staging into final parquet (upsert)
-    merge_upsert_parquet(parquet_path, staging_path, parquet_schema)
+    merge_upsert_parquet(parquet_path, staging_path, parquet_schema, metrics=metrics)
 
     # Mark year complete only if full run
     if DOC_LIMIT is None:
-        mark_year_done(conn, year)
+        mark_year_done(conn, year, metrics=metrics)
         year_status = "complete (marked)"
     else:
         year_status = "NOT marked (DOC_LIMIT set)"
@@ -539,6 +642,26 @@ def run_year(
     print(f"Wall-clock time: {wall_clock:,.3f} s")
     print(f"Throughput: {toks_per_s:,.1f} tokens/sec")
     print(f"Effective parallelism (chunking): {effective_parallelism:,.2f}x\n")
+
+    # IO / tracking metrics
+    parquet_s = metrics.total_parquet_s()
+    sqlite_s = metrics.total_sqlite_s()
+
+    print("=== IO / Tracking Metrics ===")
+    print(f"Parquet staging write time: {metrics.parquet_stage_write_s:,.3f} s "
+          f"(batches: {metrics.parquet_stage_batches:,})")
+    print(f"Parquet merge/upsert time:  {metrics.parquet_merge_s:,.3f} s")
+    print(f"Parquet total time:         {parquet_s:,.3f} s")
+
+    print(f"SQLite read time:           {metrics.sqlite_read_s:,.3f} s (reads: {metrics.sqlite_reads:,})")
+    print(f"SQLite write+commit time:   {metrics.sqlite_write_s:,.3f} s "
+          f"(writes: {metrics.sqlite_writes:,}, commits: {metrics.sqlite_commits:,})")
+    print(f"SQLite total time:          {sqlite_s:,.3f} s")
+
+    if wall_clock > 0:
+        print(f"Parquet time share:         {100.0 * parquet_s / wall_clock:,.2f}% of wall-clock")
+        print(f"SQLite time share:          {100.0 * sqlite_s / wall_clock:,.2f}% of wall-clock")
+    print()
 
 
 # ============================================================
