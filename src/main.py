@@ -51,7 +51,7 @@ YEARS_FILE = "years.txt"   # one year per line, comments allowed with '#'
 DATASET = american_stories
 
 # Multiprocessing (chunking)
-N_PROCESSES = cpu_count()
+N_PROCESSES = min(cpu_count(), 12)
 POOL_CHUNKSIZE = 4
 
 # Dataset

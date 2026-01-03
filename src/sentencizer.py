@@ -34,6 +34,8 @@ def build_nlp():
     Kept identical to your current behavior: uses parser-based sents, with
     a small post-fix component to handle abbreviations.
     """
+    spacy.require_cpu()
+
     # Disable components that don't affect sentence segmentation via parser
     nlp = spacy.load("en_core_web_sm", disable=["ner", "attribute_ruler", "lemmatizer"])
 
