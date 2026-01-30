@@ -1,9 +1,11 @@
 mkdir -p out
 docker run -d \
-  --name my-gpu-app \
+  --name jesse-embeddings \
   --gpus all \
   --restart on-failure \
-  -e HF_TOKEN="$HF_TOKEN" \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
   -e PYTHONPATH=/app/src \
   -v "$(pwd)/src:/app/src:ro" \
   -v "$(pwd)/data:/app/data:ro" \
