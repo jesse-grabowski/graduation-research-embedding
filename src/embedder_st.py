@@ -19,7 +19,7 @@ from sentence_transformers import SentenceTransformer
 MODEL_NAME: str = "Qwen/Qwen3-Embedding-4B"
 
 # Embedding options
-BATCH_SIZE: int = 64
+BATCH_SIZE: int = 32
 NORMALIZE_EMBEDDINGS: bool = True
 
 # Device override:
@@ -104,6 +104,7 @@ def build_embedder(
         extra_kwargs["model_kwargs"] = CUDA_MODEL_KWARGS
 
     model = SentenceTransformer(model_name, device=device, truncate_dim=768, **extra_kwargs)
+    model.max_seq_length = 256
 
     tok = getattr(model, "tokenizer", None)
     if tok is None:
